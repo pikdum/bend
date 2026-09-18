@@ -3512,6 +3512,12 @@ static id<MTLComputeCommandEncoder> gpu_enc;
 static CUdevice   gpu_dev;
 static CUmodule   gpu_lib;
 static CUfunction gpu_pso;
+#if BEND_HIP
+static Corpus     gpu_heap;
+static u64        gpu_bytes;
+static bool       gpu_resident;
+static u64        gpu_passes;
+#endif
 #endif
 static bool io_gpu;
 static Stk  io_stk;
@@ -4936,11 +4942,10 @@ static bool gpu_probe(void) {
     return false;
   }
   gpu_dev = 0;
-  int managed = 0, l2 = 1 << 23;
-  hipDeviceGetAttribute(&managed, hipDeviceAttributeConcurrentManagedAccess, gpu_dev);
+  int l2 = 1 << 23;
   hipDeviceGetAttribute(&l2, hipDeviceAttributeL2CacheSize, gpu_dev);
   gpu_shape(l2 >> 16);
-  return managed != 0;
+  return true;
 #else
   int       managed = 0;
   CUcontext ctx;
@@ -4961,6 +4966,15 @@ static bool gpu_probe(void) {
 }
 
 static Corpus gpu_map(u64 bytes) {
+#if BEND_HIP
+  // An indexed corpus can live at different addresses on host and device.
+  // Explicit VRAM avoids PCIe reads on GPUs without managed-page migration.
+  if (hipMalloc((void**)&gpu_heap, bytes) != hipSuccess) {
+    err_fail("HIP corpus allocation failed");
+  }
+  gpu_bytes = bytes;
+  return pool_mmap(bytes);
+#else
   CUdeviceptr p = 0;
   if (cuMemAllocManaged(&p, bytes, CU_MEM_ATTACH_GLOBAL) != CUDA_SUCCESS) {
     err_fail("corpus reservation failed");
@@ -4972,7 +4986,17 @@ static Corpus gpu_map(u64 bytes) {
   cuMemAdvise(p, bytes, CU_MEM_ADVISE_SET_PREFERRED_LOCATION, gpu_dev);
 #endif
   return (Corpus)(uintptr_t)p;
+#endif
 }
+
+#if BEND_HIP
+static void gpu_copy(void* dst, const void* src, u64 bytes, hipMemcpyKind kind) {
+  hipError_t err = hipMemcpy(dst, src, bytes, kind);
+  if (err != hipSuccess) {
+    err_fail(hipGetErrorString(err));
+  }
+}
+#endif
 
 static u64 gpu_hash(void) {
   u64 key = 14695981039346656037ull ^ CUBE_LOG;
@@ -5042,7 +5066,7 @@ static u64 gpu_span(void) {
   size_t span = 0;
   cuDeviceTotalMem(&span, gpu_dev);
 #if BEND_HIP
-  // On GPUs without page migration, managed memory occupies host RAM.
+  // Leave room for other applications and the matching host corpus.
   if (span > (2ull << 30)) span = 2ull << 30;
 #endif
   return span;
@@ -5069,7 +5093,11 @@ static void gpu_load(u64 bytes) {
 }
 
 static void gpu_kernel(u32 pass, u32 groups) {
+#if BEND_HIP
+  void* args[] = { &gpu_heap, &pass };
+#else
   void* args[] = { &CORPUS, &pass };
+#endif
   if (cuLaunchKernel(gpu_pso, groups, 1, 1, CUBE_T, 1, 1, TG_HOLD * 8, NULL,
     args, NULL) != CUDA_SUCCESS) {
     err_fail("device launch failed");
@@ -5077,10 +5105,33 @@ static void gpu_kernel(u32 pass, u32 groups) {
 }
 
 static void gpu_pass(u32 f) {
+#if BEND_HIP
+  // Only cube_run's cursor changes between passes. CPU evaluation resumes
+  // after the root result (or error), when the complete corpus comes back.
+  if (!gpu_resident) {
+    gpu_copy(gpu_heap, CORPUS, gpu_bytes, hipMemcpyHostToDevice);
+  } else {
+    gpu_copy(gpu_heap + H_CURSOR, CORPUS + H_CURSOR, sizeof(u64), hipMemcpyHostToDevice);
+  }
+  gpu_resident = true;
+  gpu_passes += 1;
+#endif
   gpu_run(f);
   if (cuCtxSynchronize() != CUDA_SUCCESS) {
     err_fail("device fault");
   }
+#if BEND_HIP
+  gpu_copy(CORPUS, gpu_heap, ALC_OFF * sizeof(u64), hipMemcpyDeviceToHost);
+  if (root_done(CORPUS) || a32_load(a32_at(CORPUS, H_ERROR_CODE)) != 0) {
+    gpu_copy(CORPUS, gpu_heap, gpu_bytes, hipMemcpyDeviceToHost);
+    gpu_resident = false;
+  }
+  if (getenv("BEND_GPU_TRACE")) {
+    fprintf(stderr, "bend: HIP pass %llu, groups %u, resident %u, pages %u/%u\n",
+      (unsigned long long)gpu_passes, CUBE_G, gpu_resident,
+      a32_load(a32_at(CORPUS, H_BUMP)), a32_load(a32_at(CORPUS, H_CAP)));
+  }
+#endif
 }
 
 #else
@@ -5152,7 +5203,7 @@ static Corpus corpus_setup(bool gpu, long threads, u64 bytes) {
   }
   cap = cap < ~0u ? cap : ~0u - 1;
   Corpus H  = CORPUS;
-#if BEND_CUDA || BEND_HIP
+#if BEND_CUDA
   if (gpu) {
     cuMemsetD8((CUdeviceptr)(uintptr_t)H, 0, STAK_OFF * 8);
     cuCtxSynchronize();
@@ -5967,6 +6018,12 @@ int main(int argc, char** argv) {
   Corpus H  = corpus_setup(dev, thr > 0 ? thr : cpu_count(), mem);
   int code  = io_loop(H);
   io_sync();
+#if BEND_HIP
+  if (gpu_heap != NULL) {
+    hipFree(gpu_heap);
+    munmap(CORPUS, gpu_bytes);
+  }
+#endif
   return code;
 }
 

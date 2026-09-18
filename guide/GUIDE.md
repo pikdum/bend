@@ -510,9 +510,12 @@ the Base library (`bend base Map` prints one name and everything under it), and
 `bend --help` lists the other commands.
 
 Use `./file --gpu on` to require a GPU instead of allowing CPU fallback.
-HIP defaults to a 2 GB heap; `--gpu 1GB` overrides it. On AMD GPUs without
-page migration, managed memory uses host RAM and memory-heavy kernels may
-run much slower than on the CPU.
+HIP defaults to a 2 GB VRAM heap; `--gpu 1GB` overrides it. It also reserves
+a matching host heap, copying at CPU/GPU handoffs and keeping intermediate
+GPU passes resident. Small offloads can cost more to transfer than compute;
+batch work into substantial marked calls. `BEND_GPU_TRACE=1 ./file --gpu on`
+logs actual HIP scheduler passes to stderr. A mark inside already parallel
+work may run on the CPU; selecting a GPU alone does not prove offloading.
 
 ## Syntax Reference
 

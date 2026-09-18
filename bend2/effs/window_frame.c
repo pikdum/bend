@@ -285,6 +285,11 @@ static void window_fill(Env e, u32* pix, u32 w, u32 h, Term image, u32 k) {
 #if BEND_CUDA || BEND_HIP
   if (io_gpu) {
     Corpus H    = e.mem;
+#if BEND_HIP
+    // IO may build or modify the image after the last offloaded call.
+    gpu_copy(gpu_heap, H, gpu_bytes, hipMemcpyHostToDevice);
+    H = gpu_heap;
+#endif
     u64    len  = (u64)w * h * 4;
     void*  args[] = { &H, &image, &w, &h, &k, &window_buf };
     if (window_pso == NULL && cuModuleGetFunction(&window_pso, gpu_lib,
