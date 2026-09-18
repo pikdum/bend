@@ -246,16 +246,17 @@ function cc_find(gpu: boolean): string {
 
 // cli_build builds the C file at `file` into the binary `bin`. A `!` program
 // builds with the GPU lane and writes its GPU program too (on Linux only with
-// CUDA at $CUDA_HOME, else at /usr/local/cuda, its libraries in lib64 or, as
-// nix lays them, lib; else the ! runs on the cores). On macOS a program with
-// a framework (#import: a window, audio) builds as Objective-C; on Linux it
-// links the X11 and ALSA libraries it includes.
+// CUDA or HIP installed; else the ! runs on the cores). On macOS a program
+// with a framework (#import: a window, audio) builds as Objective-C; on Linux
+// it links the X11 and ALSA libraries it includes.
 function cli_build(bin: string, file: string): void {
   const c     = fs.readFileSync(file, "utf8");
   const mac   = process.platform === "darwin";
-  const cuda  = process.env.CUDA_HOME || "/usr/local/cuda";
-  const bangs = !/^#define BANGS\s+0$/m.test(c)
-    && (mac || fs.existsSync(cuda + "/include/nvrtc.h"));
+  const cuda  = process.env.CUDA_HOME || process.env.CUDA_PATH || "/usr/local/cuda";
+  const rocm  = process.env.ROCM_PATH ?? "/opt/rocm";
+  const hascu = fs.existsSync(path.join(cuda, "include/nvrtc.h"));
+  const hip   = !mac && !hascu && fs.existsSync(path.join(rocm, "include/hip/hiprtc.h"));
+  const bangs = !/^#define BANGS\s+0$/m.test(c) && (mac || hascu || hip);
   const cc    = cc_find(bangs);
   const objc  = mac && (bangs || /^#import /m.test(c))
     ? ["-x", "objective-c", "-fobjc-arc", "-fmodules"] : [];
@@ -264,8 +265,10 @@ function cli_build(bin: string, file: string): void {
   const cpu = [...objc, "-std=c11", "-O3", file, "-lpthread", "-lm",
     ...libs, "-o", path.resolve(bin)];
   const gpu = mac ? ["-DBEND_METAL=1", ...cpu]
-    : ["-DBEND_CUDA=1", "-I" + cuda + "/include", "-L" + cuda + "/lib64",
-      "-L" + cuda + "/lib", ...cpu, "-lcuda", "-lnvrtc"];
+    : hip ? ["-DBEND_HIP=1", "-D__HIP_PLATFORM_AMD__", "-I" + rocm + "/include",
+      "-L" + rocm + "/lib", "-Wl,-rpath," + rocm + "/lib", ...cpu, "-lamdhip64", "-lhiprtc"]
+    : ["-DBEND_CUDA=1", "-I" + cuda + "/include",
+      "-L" + cuda + "/lib64", "-L" + cuda + "/lib", ...cpu, "-lcuda", "-lnvrtc"];
   const steps: [string, string[]][] = bangs
     ? [[cc, gpu], [path.resolve(bin), ["--gpu-build"]]] : [[cc, cpu]];
   for (const [cmd, args] of steps) {

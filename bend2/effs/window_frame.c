@@ -272,7 +272,7 @@ static void window_pump(BendWin* win) {
   }
 }
 
-#if BEND_CUDA
+#if BEND_CUDA || BEND_HIP
 static CUfunction  window_pso;
 static CUdeviceptr window_buf;
 static u64         window_len;
@@ -282,7 +282,7 @@ static u64         window_len;
 // there (the tree's pages never leave it), else window_pix a pixel at
 // a time.
 static void window_fill(Env e, u32* pix, u32 w, u32 h, Term image, u32 k) {
-#if BEND_CUDA
+#if BEND_CUDA || BEND_HIP
   if (io_gpu) {
     Corpus H    = e.mem;
     u64    len  = (u64)w * h * 4;

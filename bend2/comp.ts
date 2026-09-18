@@ -3150,6 +3150,11 @@ const TEMPLATE = String.raw`
 // Imports
 // =======
 
+#ifdef __HIPCC_RTC__
+#define __CUDACC_RTC__ 1
+#pragma clang force_cuda_host_device begin
+#endif
+
 #pragma clang fp contract(off)
 
 #ifdef __METAL_VERSION__
@@ -3180,9 +3185,44 @@ using namespace metal;
 // #include, not #import: bend -o reads an #import as an effect's framework
 #include <Metal/Metal.h>
 #include <Foundation/Foundation.h>
-#elif BEND_CUDA
+#elif BEND_CUDA || BEND_HIP
+#if BEND_HIP
+#include <hip/hip_runtime_api.h>
+#include <hip/hiprtc.h>
+// HIP's driver API shares the CUDA runtime below, including the kernel.
+#define CUdevice hipDevice_t
+#define CUmodule hipModule_t
+#define CUfunction hipFunction_t
+#define CUdeviceptr hipDeviceptr_t
+#define CUDA_SUCCESS hipSuccess
+#define CU_MEM_ATTACH_GLOBAL hipMemAttachGlobal
+#define CU_MEM_ADVISE_SET_PREFERRED_LOCATION hipMemAdviseSetPreferredLocation
+#define CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE hipDeviceAttributeL2CacheSize
+#define cuDeviceGetAttribute hipDeviceGetAttribute
+#define cuMemAllocManaged hipMallocManaged
+#define cuMemAdvise hipMemAdvise
+#define cuDeviceTotalMem hipDeviceTotalMem
+#define cuModuleLoadData hipModuleLoadData
+#define cuModuleGetFunction hipModuleGetFunction
+#define cuLaunchKernel hipModuleLaunchKernel
+#define cuCtxSynchronize hipDeviceSynchronize
+#define cuMemsetD8 hipMemsetD8
+#define cuMemAlloc hipMalloc
+#define cuMemFree hipFree
+#define cuMemcpyDtoH hipMemcpyDtoH
+#define nvrtcProgram hiprtcProgram
+#define NVRTC_SUCCESS HIPRTC_SUCCESS
+#define nvrtcCreateProgram hiprtcCreateProgram
+#define nvrtcCompileProgram hiprtcCompileProgram
+#define nvrtcGetProgramLogSize hiprtcGetProgramLogSize
+#define nvrtcGetProgramLog hiprtcGetProgramLog
+#define nvrtcGetCUBINSize hiprtcGetCodeSize
+#define nvrtcGetCUBIN hiprtcGetCode
+#define nvrtcDestroyProgram hiprtcDestroyProgram
+#else
 #include <cuda.h>
 #include <nvrtc.h>
+#endif
 #include <fcntl.h>
 #include <sys/stat.h>
 #endif
@@ -3455,7 +3495,7 @@ static lock           pool_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t pool_wake = PTHREAD_COND_INITIALIZER;
 
 // The device program compiles from the binary's own text.
-#if BEND_METAL || BEND_CUDA
+#if BEND_METAL || BEND_CUDA || BEND_HIP
 #pragma clang diagnostic ignored "-Wc23-extensions"
 static const char BEND_SRC[] = {
 #embed __FILE__
@@ -3468,7 +3508,7 @@ static id<MTLCommandQueue>         gpu_que;
 static id<MTLComputePipelineState> gpu_pso;
 static id<MTLBuffer>               gpu_buf;
 static id<MTLComputeCommandEncoder> gpu_enc;
-#elif BEND_CUDA
+#elif BEND_CUDA || BEND_HIP
 static CUdevice   gpu_dev;
 static CUmodule   gpu_lib;
 static CUfunction gpu_pso;
@@ -3480,7 +3520,7 @@ static const char* CLI_HELP =
   "usage: %s [options]\n"
   "  --threads N       worker threads, 1 to 128 (default: the CPU count)\n"
   "  --gpu on|off|4GB  run ! calls on the GPU, over this much of its memory\n"
-  "                    (default: on if present, over 2GB on Metal)\n"
+  "                    (default: on if present, over 2GB on Metal/HIP)\n"
   "  --gpu-build       write the GPU program and exit\n"
   "  --help            show this text\n";
 
@@ -4760,11 +4800,11 @@ static void gpu_note(const char* path) {
     " stale)\n", path);
 }
 
-#if !BEND_CUDA
+#if !BEND_CUDA && !BEND_HIP
 #define gpu_map pool_mmap
 #endif
 
-#if BEND_METAL || BEND_CUDA
+#if BEND_METAL || BEND_CUDA || BEND_HIP
 
 static void gpu_kernel(u32 pass, u32 groups);
 
@@ -4880,7 +4920,7 @@ static void gpu_pass(u32 f) {
   }
 }
 
-#elif BEND_CUDA
+#elif BEND_CUDA || BEND_HIP
 
 // the bag from the device: a group of 128 lanes per 64 KB of L2, a power of
 // two from 16 to 128 groups. Apple keeps the 128 the bag was tuned on: on an
@@ -4891,6 +4931,17 @@ static void gpu_shape(int units) {
 }
 
 static bool gpu_probe(void) {
+#if BEND_HIP
+  if (hipInit(0) != hipSuccess || hipSetDevice(0) != hipSuccess) {
+    return false;
+  }
+  gpu_dev = 0;
+  int managed = 0, l2 = 1 << 23;
+  hipDeviceGetAttribute(&managed, hipDeviceAttributeConcurrentManagedAccess, gpu_dev);
+  hipDeviceGetAttribute(&l2, hipDeviceAttributeL2CacheSize, gpu_dev);
+  gpu_shape(l2 >> 16);
+  return managed != 0;
+#else
   int       managed = 0;
   CUcontext ctx;
   // one stream, so one hardware queue: the default 8 each cost a channel
@@ -4906,6 +4957,7 @@ static bool gpu_probe(void) {
   return managed != 0
     && cuDevicePrimaryCtxRetain(&ctx, gpu_dev) == CUDA_SUCCESS
     && cuCtxSetCurrent(ctx) == CUDA_SUCCESS;
+#endif
 }
 
 static Corpus gpu_map(u64 bytes) {
@@ -4931,35 +4983,48 @@ static u64 gpu_hash(void) {
 }
 
 static bool gpu_make(const char* path) {
+#if BEND_HIP
+  hipDeviceProp_t prop;
+  if (hipGetDeviceProperties(&prop, gpu_dev) != hipSuccess) {
+    err_fail("cannot query the HIP device");
+  }
+  char arch[300];
+  snprintf(arch, sizeof arch, "--gpu-architecture=%s", prop.gcnArchName);
+#else
   int cc[2] = {0, 0};
   cuDeviceGetAttribute(cc,
     CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, gpu_dev);
   cuDeviceGetAttribute(cc + 1,
     CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, gpu_dev);
   char arch[40];
-  char bag[24];
   snprintf(arch, sizeof arch, "--gpu-architecture=sm_%d%d", cc[0], cc[1]);
+#endif
+  char bag[24];
   snprintf(bag, sizeof bag, "-DCUBE_LOG=%u", CUBE_LOG);
+#if BEND_HIP
+  const char* opts[] = { arch, bag, "-ffp-contract=off" };
+#else
   const char* opts[] = { arch, bag, "--fmad=false", "-default-device" };
+#endif
   nvrtcProgram prog;
   if (nvrtcCreateProgram(&prog, BEND_SRC, "bend.cu", 0, NULL, NULL)
     != NVRTC_SUCCESS) {
-    err_fail("cannot compile the CUDA library");
+    err_fail("cannot compile the GPU library");
   }
-  if (nvrtcCompileProgram(prog, 4, opts) != NVRTC_SUCCESS) {
+  if (nvrtcCompileProgram(prog, sizeof opts / sizeof *opts, opts) != NVRTC_SUCCESS) {
     size_t n = 0;
     nvrtcGetProgramLogSize(prog, &n);
     char* log = calloc(n + 1, 1);
     if (log != NULL && nvrtcGetProgramLog(prog, log) == NVRTC_SUCCESS) {
       fprintf(stderr, "%s\n", log);
     }
-    err_fail("cannot compile the CUDA library");
+    err_fail("cannot compile the GPU library");
   }
   size_t len = 0;
   nvrtcGetCUBINSize(prog, &len);
   char* bin = malloc(len);
   if (bin == NULL || nvrtcGetCUBIN(prog, bin) != NVRTC_SUCCESS) {
-    err_fail("cannot load the CUDA library");
+    err_fail("cannot load the GPU library");
   }
   nvrtcDestroyProgram(&prog);
   u64   key = gpu_hash();
@@ -4967,7 +5032,7 @@ static bool gpu_make(const char* path) {
   bool  ok  = out != NULL && fwrite(&key, 8, 1, out) == 1
     && fwrite(bin, 1, len, out) == len && fclose(out) == 0;
   if (cuModuleLoadData(&gpu_lib, bin) != CUDA_SUCCESS) {
-    err_fail("cannot load the CUDA library");
+    err_fail("cannot load the GPU library");
   }
   free(bin);
   return path == NULL || ok;
@@ -4976,6 +5041,10 @@ static bool gpu_make(const char* path) {
 static u64 gpu_span(void) {
   size_t span = 0;
   cuDeviceTotalMem(&span, gpu_dev);
+#if BEND_HIP
+  // On GPUs without page migration, managed memory occupies host RAM.
+  if (span > (2ull << 30)) span = 2ull << 30;
+#endif
   return span;
 }
 
@@ -5083,7 +5152,7 @@ static Corpus corpus_setup(bool gpu, long threads, u64 bytes) {
   }
   cap = cap < ~0u ? cap : ~0u - 1;
   Corpus H  = CORPUS;
-#if BEND_CUDA
+#if BEND_CUDA || BEND_HIP
   if (gpu) {
     cuMemsetD8((CUdeviceptr)(uintptr_t)H, 0, STAK_OFF * 8);
     cuCtxSynchronize();
