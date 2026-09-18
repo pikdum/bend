@@ -1603,6 +1603,7 @@ function node_fill(fl: File, k: string, alloc: string,
   exprs: string[], shr = false): string {
   const nd = name_local(fl, k);
   file_push(fl, `u64 ${nd} = ${alloc};`);
+  file_push(fl, `if (err_seen(e.mem)) { return 0; }`);
   exprs.forEach((w, j) => {
     file_push(fl, `e.mem[${nd} + ${j}] = ${shr ? `rfc_seal(e, ${w})` : w};`);
   });
@@ -3311,7 +3312,8 @@ using namespace metal;
 #define WL_JMP(F)  __attribute__((musttail)) return WL_##F(WL_ALL)
 #define WL_DYN(F)  __attribute__((musttail)) return wl_tab[F](WL_ALL)
 #endif
-#define WL_SPIN     for (;;) { if (err_spun(e.mem, &wpoll)) { return 0; }
+#define WL_SPIN     if (err_seen(e.mem)) { return 0; } \
+  for (;;) { if (err_spun(e.mem, &wpoll)) { return 0; }
 #define WL_SPUN     } break;
 #define WL_AGAIN(F) continue
 #define WL_POP()    { sp -= LANE_STEP; WL_DYN((Fid)STK(0)); }
@@ -3763,7 +3765,7 @@ OUTLINE Loc heap_alloc_miss(Env e, Cls cls) {
     u32 p     = a32_add(a32_at(H, H_BUMP), pages);
     if ((u64)p + pages > a32_load(a32_at(H, H_CAP))) {
       err_post(H, ERR_HEAP);
-      p = 0;
+      return 0;
     }
     got = HEAP_OFF + ((u64)p << PAGE_BITS);
     for (u32 i = 1; i <= n; i += 1) {
@@ -3849,6 +3851,9 @@ OUTLINE Term rfc_wrap(Env e, Term t, u32 cnt) {
     return t;
   }
   Loc r = heap_alloc(e, 0);
+  if (err_seen(e.mem)) {
+    return t;
+  }
   e.mem[r] = ((u64)term_loc(t) << 24) | cnt;
   return (t & ~LOC_MASK) | RFC_BIT | r;
 }
@@ -3910,6 +3915,9 @@ INLINE void blk_free(Env e, Term t) {
 }
 
 FAR void term_drop(Env e, Term t) {
+  if (err_seen(e.mem)) {
+    return;
+  }
   Corpus H = e.mem;
   u64  cur = 0;
   Term c0  = 0;
@@ -4224,6 +4232,9 @@ INLINE Ring ring_flip(u32 i) {
 INLINE Loc task_node(Env e, Fid fid, Term cont, u32 idx, u32 rem) {
   u32 ar  = fid_arity(fid);
   Loc loc = heap_alloc(e, cls_fit(ar + 2));
+  if (err_seen(e.mem)) {
+    return 0;
+  }
   for (u32 i = 0; rem && i < ar; i += 1) {
     e.mem[loc + i] = TERM_HOLE;
   }
@@ -4325,6 +4336,9 @@ static Reply work_loop(Env e, Stk sp, Term t, bool seq) {
   u32 rn = 0;
   r0 = t;
 #if DEVICE
+  if (err_seen(e.mem)) {
+    return 0;
+  }
   Fid fid   = FID_ENTER;
   u32 wpoll = 0;
   for (;;) {
@@ -4366,6 +4380,9 @@ static Reply work_loop(Env e, Stk sp, Term t, bool seq) {
     Term x = r0;
     WL_OPEN
     Loc l = heap_alloc(e, 0);
+    if (err_seen(e.mem)) {
+      return 0;
+    }
     e.mem[l] = x;
     r0 = term_ctr(CID_EMIT, l);
     WL_RETN(1);
@@ -4532,7 +4549,11 @@ extern "C" __global__ void bend_dev(Corpus H, u32 pass) {
   u32 lane  = threadIdx.x;
 #endif
   if (pass == 2) {
-    bank_pack(H, lane);
+    // The previous kernel has finished: this error read is uniform, so all
+    // lanes either enter bank_pack's barriers or skip the damaged banks.
+    if (!err_seen(H)) {
+      bank_pack(H, lane);
+    }
     return;
   }
   u32  stride = grids == 1 ? CUBE_G : 1;
