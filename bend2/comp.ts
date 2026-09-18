@@ -3196,18 +3196,11 @@ using namespace metal;
 #define CUfunction hipFunction_t
 #define CUdeviceptr hipDeviceptr_t
 #define CUDA_SUCCESS hipSuccess
-#define CU_MEM_ATTACH_GLOBAL hipMemAttachGlobal
-#define CU_MEM_ADVISE_SET_PREFERRED_LOCATION hipMemAdviseSetPreferredLocation
-#define CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE hipDeviceAttributeL2CacheSize
-#define cuDeviceGetAttribute hipDeviceGetAttribute
-#define cuMemAllocManaged hipMallocManaged
-#define cuMemAdvise hipMemAdvise
 #define cuDeviceTotalMem hipDeviceTotalMem
 #define cuModuleLoadData hipModuleLoadData
 #define cuModuleGetFunction hipModuleGetFunction
 #define cuLaunchKernel hipModuleLaunchKernel
 #define cuCtxSynchronize hipDeviceSynchronize
-#define cuMemsetD8 hipMemsetD8
 #define cuMemAlloc hipMalloc
 #define cuMemFree hipFree
 #define cuMemcpyDtoH hipMemcpyDtoH
@@ -4963,9 +4956,12 @@ static bool gpu_probe(void) {
     return false;
   }
   gpu_dev = 0;
-  int l2 = 1 << 23;
-  hipDeviceGetAttribute(&l2, hipDeviceAttributeL2CacheSize, gpu_dev);
-  gpu_shape(l2 >> 16);
+  // The L2 heuristic gives an RX 7900 XT (84 CUs, 6 MB L2 under an 80 MB
+  // L3) 64 groups; the bag's full 128 ran the sixteen benches 16% faster
+  // in sum (lexer 1.8x, raytrace 1.4x, bitonic 0.8x). BEND_GPU_GROUPS=16..128
+  // overrides it for experiments.
+  const char* groups = getenv("BEND_GPU_GROUPS");
+  gpu_shape(groups != NULL && atoi(groups) > 0 ? atoi(groups) : 128);
   return true;
 #else
   int       managed = 0;
@@ -4990,7 +4986,10 @@ static Corpus gpu_map(u64 bytes) {
 #if BEND_HIP
   // An indexed corpus can live at different addresses on host and device.
   // Explicit VRAM avoids PCIe reads on GPUs without managed-page migration.
-  if (hipMalloc((void**)&gpu_heap, bytes) != hipSuccess) {
+  // Zeroed like the host mapping: the lanes' allocator rows, the stacks and
+  // the ring slots never cross the bus (gpu_sync).
+  if (hipMalloc((void**)&gpu_heap, bytes) != hipSuccess
+    || hipMemset(gpu_heap, 0, bytes) != hipSuccess) {
     err_fail("HIP corpus allocation failed");
   }
   gpu_bytes = bytes;
@@ -5011,10 +5010,63 @@ static Corpus gpu_map(u64 bytes) {
 }
 
 #if BEND_HIP
+static u64 gpu_moved;
+
 static void gpu_copy(void* dst, const void* src, u64 bytes, hipMemcpyKind kind) {
   hipError_t err = hipMemcpy(dst, src, bytes, kind);
   if (err != hipSuccess) {
     err_fail(hipGetErrorString(err));
+  }
+  gpu_moved += bytes;
+}
+
+// Words [from, to) of the corpus, up to the device or down to the host.
+static void gpu_words(u64 from, u64 to, bool up) {
+  if (to > from) {
+    gpu_copy(up ? gpu_heap + from : CORPUS + from,
+      up ? CORPUS + from : gpu_heap + from, (to - from) * sizeof(u64),
+      up ? hipMemcpyHostToDevice : hipMemcpyDeviceToHost);
+  }
+}
+
+// A handoff moves what the other side reads: the header, the ring cursors,
+// the static image and the heap up to the bump, and each bank's entries.
+// The lanes' allocator rows and stacks are the device's alone (the host
+// has ALC and its own stacks). Ring slots hold nothing at a handoff but
+// the task the host just pushed on ring 0; a ring still holding entries
+// moves the whole slot region instead.
+static void gpu_sync(bool up) {
+  Corpus H       = CORPUS;
+  u64    cursors = RING_OFF + RING_LEN * LANES;
+  if (!up) {
+    gpu_words(0, ALC_OFF, false);
+    gpu_words(cursors, cursors + 2 * LANES, false);
+  }
+  bool busy = false;
+  for (u32 r = 0; r < LANES; r += 1) {
+    u32 get = a32_load(ring_get(H, r));
+    u32 put = a32_load(ring_put(H, r));
+    if (up && r == 0 && put - get == 1) {
+      u64 slot = RING_OFF + ((put - 1) & (RING_LEN - 1)) * LANES;
+      gpu_words(slot, slot + 1, true);
+    } else if (get != put) {
+      busy = true;
+    }
+  }
+  if (busy) {
+    gpu_words(RING_OFF, cursors, up);
+  }
+  if (up) {
+    gpu_words(0, ALC_OFF, true);
+    gpu_words(cursors, cursors + 2 * LANES, true);
+  }
+  u64 bump = a32_load(a32_at(H, H_BUMP));
+  u64 cap  = a32_load(a32_at(H, H_CAP));
+  gpu_words(STAT_OFF, HEAP_OFF + ((bump < cap ? bump : cap) << PAGE_BITS), up);
+  for (Cls c = 0; c < NCLS_ALL; c += 1) {
+    Bank* b    = bank_at(H, c);
+    u64   room = 2 * (cap >> ((c < NCLS ? NCLS : c) - PAGE_BITS));
+    gpu_words(b->off, b->off + (b->wr < room ? b->wr : room), up);
   }
 }
 #endif
@@ -5128,9 +5180,9 @@ static void gpu_kernel(u32 pass, u32 groups) {
 static void gpu_pass(u32 f) {
 #if BEND_HIP
   // Only cube_run's cursor changes between passes. CPU evaluation resumes
-  // after the root result (or error), when the complete corpus comes back.
+  // after the root result (or error), when the live corpus comes back.
   if (!gpu_resident) {
-    gpu_copy(gpu_heap, CORPUS, gpu_bytes, hipMemcpyHostToDevice);
+    gpu_sync(true);
   } else {
     gpu_copy(gpu_heap + H_CURSOR, CORPUS + H_CURSOR, sizeof(u64), hipMemcpyHostToDevice);
   }
@@ -5144,13 +5196,14 @@ static void gpu_pass(u32 f) {
 #if BEND_HIP
   gpu_copy(CORPUS, gpu_heap, ALC_OFF * sizeof(u64), hipMemcpyDeviceToHost);
   if (root_done(CORPUS) || a32_load(a32_at(CORPUS, H_ERROR_CODE)) != 0) {
-    gpu_copy(CORPUS, gpu_heap, gpu_bytes, hipMemcpyDeviceToHost);
+    gpu_sync(false);
     gpu_resident = false;
   }
   if (getenv("BEND_GPU_TRACE")) {
-    fprintf(stderr, "bend: HIP pass %llu, groups %u, resident %u, pages %u/%u\n",
-      (unsigned long long)gpu_passes, CUBE_G, gpu_resident,
-      a32_load(a32_at(CORPUS, H_BUMP)), a32_load(a32_at(CORPUS, H_CAP)));
+    fprintf(stderr, "bend: HIP pass %llu, groups %u, resident %u, pages %u/%u,"
+      " moved %llu KB\n", (unsigned long long)gpu_passes, CUBE_G, gpu_resident,
+      a32_load(a32_at(CORPUS, H_BUMP)), a32_load(a32_at(CORPUS, H_CAP)),
+      (unsigned long long)(gpu_moved >> 10));
   }
 #endif
 }

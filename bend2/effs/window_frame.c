@@ -287,7 +287,7 @@ static void window_fill(Env e, u32* pix, u32 w, u32 h, Term image, u32 k) {
     Corpus H    = e.mem;
 #if BEND_HIP
     // IO may build or modify the image after the last offloaded call.
-    gpu_copy(gpu_heap, H, gpu_bytes, hipMemcpyHostToDevice);
+    gpu_sync(true);
     H = gpu_heap;
 #endif
     u64    len  = (u64)w * h * 4;
@@ -309,6 +309,17 @@ static void window_fill(Env e, u32* pix, u32 w, u32 h, Term image, u32 k) {
       NULL, args, NULL) != CUDA_SUCCESS
       || cuMemcpyDtoH(pix, window_buf, len) != CUDA_SUCCESS) {
       err_fail("the frame's device fill failed");
+    }
+    // BEND_WINDOW_CHECK=1 compares every device pixel with the host.
+    if (getenv("BEND_WINDOW_CHECK")) {
+      u64 bad = 0;
+      for (u32 y = 0; y < h; y += 1) {
+        for (u32 x = 0; x < w; x += 1) {
+          bad += pix[y * w + x] != window_pix(e.mem, image, k, x, y);
+        }
+      }
+      fprintf(stderr, "bend: window check, %llu of %llu pixels differ\n",
+        (unsigned long long)bad, (unsigned long long)w * h);
     }
     return;
   }
