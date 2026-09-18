@@ -1,6 +1,6 @@
 # AMD HIP backend
 
-This fork adds a native HIP/HIPRTC target to Bend 2.0.4. The compiler selects
+This fork adds a native HIP/HIPRTC target to Bend 2.0.5. The compiler selects
 HIP on Linux when ROCm is present and CUDA is absent. `ROCM_PATH` defaults to
 `/opt/rocm`; `CC` can select a Clang with C23 `#embed` support (tested: Clang
 21.1.8). Bun runs the compiler. There is no CUDA translation layer.
@@ -60,6 +60,9 @@ the compiler/runtime, not the language core (`bend2/bend.ts` is unchanged).
 This explains and repairs a reproduced native HIP failure. It does not establish
 the cause of every earlier SCALE/driver fault or certify arbitrary GPU programs.
 Metal and NVIDIA hardware were unavailable for cross-device execution checks.
+
+The four HIP commits were rebased onto upstream 2.0.5 before packaging; the
+CLI retains upstream CUDA_HOME/lib handling and compiler fallback.
 
 ## Local validation
 

@@ -502,7 +502,7 @@ A `main` that returns `IO` runs compiled; one that returns a value is normalized
 by the checker (slow for big work) and printed; a file with no `main` just
 checks. A binary that uses `!` builds its GPU program too, as `file.gpu`, which
 must stay beside it. On macOS it needs Metal. On Linux it uses CUDA at
-`CUDA_PATH` (default `/usr/local/cuda`), or HIP at `ROCM_PATH` (default
+`CUDA_HOME` or `CUDA_PATH` (default `/usr/local/cuda`), or HIP at `ROCM_PATH` (default
 `/opt/rocm`) when CUDA is absent. HIP needs ROCm with HIPRTC. On Linux a
 program with a Window needs `libx11-dev`, one with Audio `libasound2-dev`.
 `bend guide` prints this text, `bend base` prints
@@ -587,7 +587,7 @@ Equality of values is a call, `T.is_eq(a, b)`; `==` is only the type.
 ## Under the Hood
 
 Bend's compiler emits one C file, and that file is both the CPU program and the
-GPU kernel. clang compiles it for the CPU. Metal (on Apple) or CUDA (on NVIDIA)
+GPU kernel. clang compiles it for the CPU. Metal (on Apple), CUDA (on NVIDIA), or HIP (on AMD)
 compiles the same file for the GPU. So a `!` call runs the same code on
 whichever chip it lands on.
 
