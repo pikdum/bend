@@ -1,5 +1,8 @@
 <p align="center"><picture><source media="(prefers-color-scheme: dark)" srcset="media/hero_dark.gif"><img src="media/hero.gif" width="560" alt="Bend: a fast language that blocks AI mistakes via proof"></picture></p>
 
+This fork adds an experimental native AMD HIP backend. See [HIP.md](HIP.md)
+for setup, memory behavior, validation, and the GPU heap-exhaustion repair.
+
 In the post-AGI economy, humans will eventually stop writing and reading code,
 but we still need an ambiguity-free language to communicate our intents to the
 AIs building the world around us. Bend is that language.
